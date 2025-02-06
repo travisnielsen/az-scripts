@@ -5,7 +5,8 @@ $startTime = Get-Date
 
 Connect-AzAccount -Tenant $config.tenantId
 $subscriptions = Get-AzSubscription
-$records = New-Object System.Collections.Generic.List[Object]
+$vmRecords = New-Object System.Collections.Generic.List[Object]
+$subscriptionRecords = New-Object System.Collections.Generic.List[Object]
 
 foreach ($subscription in $subscriptions) {
     Set-AzContext -Subscription $subscription.Id -Tenant $config.tenantId
@@ -24,9 +25,11 @@ foreach ($subscription in $subscriptions) {
                 foreach ($node in $irDetails.Nodes) {
 
                     Write-Host "Processing Node: $($node.MachineName)" -ForegroundColor Blue
-                    # check if node is in the $records list
-                    $vmRecord = $records | Where-Object { $_.NodeMachineName -eq $node.MachineName } | Select-Object -First 1
-                    $vmZone = ""
+                    # check if node is in the $vmRecords list
+                    $vmRecord = $vmRecords | Where-Object { $_.NodeMachineName -eq $node.MachineName } | Select-Object -First 1
+                    $vmSubscriptionId = ""
+                    $vmZoneLogical = ""
+                    $vmZonePhysical = ""
                     $vmLocation = ""
                     $vmResourceId = ""
                     $vmResourceGroup = ""
@@ -35,8 +38,10 @@ foreach ($subscription in $subscriptions) {
 
                     if ($vmRecord) {
                         Write-Host "Node already exists in records" -ForegroundColor Yellow
+                        $vmSubscriptionId = $vmRecord.VMSubscriptionId
                         $vmLocation = $vmRecord.VMLocation
-                        $vmZone = $vmRecord.VMZone
+                        $vmZoneLogical = $vmRecord.VMZoneLogical
+                        $vmZonePhysical = $vmRecord.VMZonePhysical
                         $vmResourceId = $vmRecord.VMResourceId
                         $vmResourceGroup = $vmRecord.VMResourceGroup
                         $vmSku = $vmRecord.VMSku
@@ -44,9 +49,10 @@ foreach ($subscription in $subscriptions) {
                     }
                     else {
                         # $vmData = Get-AzVM -Name $node.MachineName
-                        $vmData = Search-AzGraph -Query "Resources | where type =~ 'Microsoft.Compute/virtualMachines' | where name =~ '$($node.MachineName)' | project location, zones, id, resourceGroup, properties.hardwareProfile.vmSize, tags" | Select-Object -First 1
+                        $vmData = Search-AzGraph -Query "Resources | where type =~ 'Microsoft.Compute/virtualMachines' | where name =~ '$($node.MachineName)' | project subscriptionId, location, zones, id, resourceGroup, properties.hardwareProfile.vmSize, tags" | Select-Object -First 1
                         $vmLocation = $vmData.location
-                        $vmZone = $vmData.zones.Count -gt 0 ? $vmData.zones[0] : "N/A"
+                        $vmSubscriptionId = $vmData.subscriptionId
+                        $vmZoneLogical = $vmData.zones.Count -gt 0 ? $vmData.zones[0] : "N/A"
                         $vmResourceId = $vmData.id
                         $vmResourceGroup = $vmData.resourceGroup
                         $vmSku = $vmData.properties_hardwareProfile_vmSize
@@ -54,7 +60,35 @@ foreach ($subscription in $subscriptions) {
                         $vmTags = $vmData.tags
                     }
 
-                    $record = [PSCustomObject]@{
+                    # get subscription info so that the logical zone peering can be checked
+                    $subscriptionData = $subscriptionRecords | Where-Object { $_.SubscriptionId -eq $vmSubscriptionId } | Select-Object -First 1
+
+                    if (!$subscriptionData) {
+                        Write-Host "Looking up zone mapping data for subscription: $vmSubscriptionId" -ForegroundColor Yellow
+                        $azMappingResponse = Invoke-AzRestMethod -Method GET -Path "/subscriptions/$($vmSubscriptionId)/locations?api-version=2022-12-01"
+                        $azMappingContent = $azMappingResponse.Content
+                        $azMappingData = ($azMappingContent | ConvertFrom-Json).Value
+                        $azMappingDataFiltered = ($azMappingData| Where-Object {$_.Name -eq $config.region}) | Select-Object -First 1
+                        $azMappings = $azMappingDataFiltered.availabilityZoneMappings
+
+                        $zoneMappings = @{}
+                        foreach ($mapping in $azMappings) {
+                            $zoneMappings[$mapping.logicalZone] = $mapping.physicalZone
+                        }
+
+                        $newSubscriptionData = [PSCustomObject]@{
+                            SubscriptionId = $vmSubscriptionId
+                            ZoneMappings = $zoneMappings
+                        }
+
+                        $vmZonePhysical = $zoneMappings[$vmZoneLogical.ToString()]
+                        $subscriptionRecords.Add($newSubscriptionData)
+                    }
+                    else {
+                        $vmZonePhysical = $subscriptionData.ZoneMappings[$vmZoneLogical.ToString()]
+                    }
+
+                    $newVmRecord = [PSCustomObject]@{
                         SubscriptionId = $subscription.Id
                         SubscriptionName = $subscription.Name
                         DataFactoryName = $dataFactory.DataFactoryName
@@ -67,7 +101,9 @@ foreach ($subscription in $subscriptions) {
                         NodeVersion = $node.Version
                         NodeVersionStatus = $node.VersionStatus
                         NodeMaxConcurrentJobs = $node.MaxConcurrentJobs
-                        VMZone = $vmZone
+                        VMSubscriptionId = $vmSubscriptionId
+                        VMZoneLogical = $vmZoneLogical
+                        VMZonePhysical = $vmZonePhysical
                         VMLocation = $vmLocation
                         VMResourceId = $vmResourceId
                         VMResourceGroup = $vmResourceGroup
@@ -75,14 +111,14 @@ foreach ($subscription in $subscriptions) {
                         VMTags = $vmTags
                     }
 
-                    $records.Add($record)
+                    $vmRecords.Add($newVmRecord)
 
                     # save results to file
-                    if ($records.Count -eq 1) {
-                        $record | Export-Csv -Path $fileLocation -NoTypeInformation
+                    if ($vmRecords.Count -eq 1) {
+                        $newVmRecord | Export-Csv -Path $fileLocation -NoTypeInformation
                     }
                     else {
-                        $record | Export-Csv -Path $fileLocation -NoTypeInformation -Append
+                        $newVmRecord | Export-Csv -Path $fileLocation -NoTypeInformation -Append
                     }
                 }
             }
